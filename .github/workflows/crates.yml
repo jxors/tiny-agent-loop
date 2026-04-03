@@ -1,0 +1,12 @@
+on: workflow_dispatch
+name: Publish to crates.io
+jobs:
+  build:
+    name: Publish to crates.io
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust nightly
+        run: rustup update nightly-2026-01-19 && rustup default nightly-2026-01-19 && rustup component add rustfmt && rustup component add clippy
+      - name: Package (tiny-agent-loop)
+        run: ./crates.io_version_check.sh tiny-agent-loop || cargo publish -p tiny-agent-loop --token ${{ secrets.CRATES_IO_API_TOKEN }}

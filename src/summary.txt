@@ -1,0 +1,16 @@
+Summarize the steps you have taken so far.
+
+Requirements:
+- Preserve all important facts, decisions, and constraints.
+- Preserve user intent and goals.
+- Preserve any numbers, names, and tool outputs.
+- Remove repetition, filler, and redundant wording.
+- Keep the summary concise and structured.
+- Do not add new information.
+
+Output format:
+- Goal:
+- Key facts:
+- Decisions made:
+- Open questions:
+- Tool results (if any):
