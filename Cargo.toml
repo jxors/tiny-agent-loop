@@ -1,6 +1,6 @@
 [package]
 name = "tiny-agent-loop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "A tiny LLM agent loop library for simple one-off projects with LLMs."
@@ -14,4 +14,5 @@ futures-util = "0.3.32"
 log = "0.4.29"
 
 [dev-dependencies]
+env_logger = "0.11.10"
 tokio = { version = "1.51.0", features = ["rt-multi-thread"] }

@@ -9,10 +9,15 @@ use async_openai::{
     types::chat::{
         ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionTool, ChatCompletionTools,
-        CreateChatCompletionRequestArgs, FinishReason, FunctionObjectArgs, ResponseFormat,
-        ResponseFormatJsonSchema,
+        ChatCompletionRequestAssistantMessageContentPart,
+        ChatCompletionRequestDeveloperMessageContent,
+        ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
+        ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+        ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequestArgs, FinishReason,
+        FunctionObjectArgs, ResponseFormat, ResponseFormatJsonSchema,
     },
 };
 use futures_util::StreamExt;
@@ -188,6 +193,7 @@ pub struct Agent<T, R> {
     listen_tool_call: Option<Box<dyn Fn(&str)>>,
     _phantom: PhantomData<R>,
     finish: FinishHandler<R>,
+    model: String,
 }
 
 impl<R, T: Tools<R>> Agent<T, R> {
@@ -196,13 +202,14 @@ impl<R, T: Tools<R>> Agent<T, R> {
     /// `finish` is invoked when the LLM finishes without a tool call.
     /// When `ControlFlow::Break` is returned, the loop will terminate with the provided return value.
     /// When `ControlFlow::Continue(message)` is returned, the loop continues with the returned message appended to the chat history.
-    pub fn new(tools: T, finish: FinishHandler<R>) -> Self {
+    pub fn new(model: impl Into<String>, tools: T, finish: FinishHandler<R>) -> Self {
         Self {
             tools,
             finish,
             listen_content: None,
             listen_tool_call: None,
             _phantom: PhantomData,
+            model: model.into(),
         }
     }
 
@@ -221,17 +228,72 @@ impl<R, T: Tools<R>> Agent<T, R> {
         self
     }
 
+    /// Convenience function that calls [`Self::start_session`] followed by [`Session::run`].
+    /// 
+    /// See [`Session::run`].
+    pub async fn run<C: Config>(&mut self, client: &Client<C>, prompt: &str) -> R {
+        self.start_session(prompt).run(client).await
+    }
+
+    /// Start a new chat session with the provided prompt.
+    ///
+    /// Keeps a reference to the agent rather than consuming it, such that the agent can be re-used later.
+    pub fn start_session<'agent>(
+        &'agent mut self,
+        prompt: &str,
+    ) -> Session<&'agent mut Agent<T, R>, T, R> {
+        Session {
+            agent: self,
+            messages: vec![ChatCompletionRequestUserMessage::from(prompt).into()],
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Start a new chat session with the provided prompt.
+    ///
+    /// Consumes the [`Agent`], creating a session without lifetimes.
+    pub fn into_session(self, prompt: &str) -> Session<Agent<T, R>, T, R> {
+        Session {
+            agent: self,
+            messages: vec![ChatCompletionRequestUserMessage::from(prompt).into()],
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T, R> AsMut<Agent<T, R>> for Agent<T, R> {
+    fn as_mut(&mut self) -> &mut Agent<T, R> {
+        self
+    }
+}
+
+pub struct Session<A, T, R> {
+    agent: A,
+    messages: Vec<ChatCompletionRequestMessage>,
+    _phantom: PhantomData<(R, T)>,
+}
+
+impl<R, T: Tools<R>, A: AsMut<Agent<T, R>>> Session<A, T, R> {
+    /// Append an additional message to the chat.
+    pub fn add_message(
+        &mut self,
+        message: impl Into<ChatCompletionRequestUserMessage>,
+    ) -> &mut Self {
+        self.messages.push(message.into().into());
+        self
+    }
+
     /// Runs the agent loop. If tools were provided, they may be called.
     ///
     /// Terminates when a tool returns ControlFlow::Break.
     ///
     /// It is assumed that any single message or tool response always fits in the context window fully.
     /// If this is not the case, this function may crash.
-    pub async fn run<C: Config>(&mut self, client: &Client<C>, prompt: &str) -> R {
-        let mut messages = vec![ChatCompletionRequestUserMessage::from(prompt).into()];
-
+    pub async fn run<C: Config>(&mut self, client: &Client<C>) -> R {
         loop {
             let tools = self
+                .agent
+                .as_mut()
                 .tools
                 .iter()
                 .map(|tool| {
@@ -247,8 +309,9 @@ impl<R, T: Tools<R>> Agent<T, R> {
                 .collect::<Vec<_>>();
 
             let request = CreateChatCompletionRequestArgs::default()
-                .messages(messages.clone())
+                .messages(self.messages.clone())
                 .tools(tools)
+                .model(&self.agent.as_mut().model)
                 .build()
                 .unwrap();
 
@@ -268,35 +331,58 @@ impl<R, T: Tools<R>> Agent<T, R> {
                         {
                             // When we run out of context, we summarize older messages.
                             // It is assumed that a single message will always fit the context size.
-                            let mut messages_to_summarize = messages
-                                .drain(..messages.len().saturating_sub(3).min(1))
-                                .collect::<Vec<_>>();
+                            let num_to_summarize = {
+                                // messages: Vec<async_openai::types::chat::ChatCompletionRequestMessage>
+                                let total_characters =
+                                    self.messages.iter().map(get_message_len).sum::<usize>();
+                                let min_to_summarize = total_characters / 2;
+                                let mut running_sum = 0;
+                                self.messages
+                                    .iter()
+                                    .enumerate()
+                                    .take_while(|(n, m)| {
+                                        // 1. Ensure we leave a buffer of recent messages (at least 3)
+                                        // 2. Ensure we don't exceed the target summarization length
+
+                                        let limit = self.messages.len().saturating_sub(3).max(1);
+                                        let content_len = get_message_len(m);
+
+                                        // We continue taking messages as long as:
+                                        // We haven't reached the index limit AND we haven't reached the char limit
+                                        if *n < limit && running_sum < min_to_summarize {
+                                            running_sum += content_len;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .count()
+                            };
+                            let mut messages_to_summarize =
+                                self.messages.drain(..num_to_summarize).collect::<Vec<_>>();
                             debug!(
                                 "Context size exceeded ({err:?}), attempting summary of messages: {messages_to_summarize:#?}."
                             );
 
                             messages_to_summarize.push(
-                                ChatCompletionRequestSystemMessage::from(include_str!(
-                                    "summary.txt"
-                                ))
-                                .into(),
+                                ChatCompletionRequestUserMessage::from(include_str!("summary.txt"))
+                                    .into(),
                             );
 
                             // TODO: This will panic if there is just a single message left that doesn't fit the context window.
                             let request = CreateChatCompletionRequestArgs::default()
                                 .messages(messages_to_summarize)
+                                .model(&self.agent.as_mut().model)
                                 .build()
                                 .unwrap();
                             let response = client.chat().create(request).await.unwrap();
                             trace!("Summarized to: {response:#?}");
                             for (index, choice) in response.choices.into_iter().enumerate() {
-                                messages.insert(
+                                self.messages.insert(
                                     index,
-                                    ChatCompletionRequestAssistantMessage {
-                                        content: Some(
-                                            ChatCompletionRequestAssistantMessageContent::Text(
-                                                choice.message.content.unwrap(),
-                                            ),
+                                    ChatCompletionRequestUserMessage {
+                                        content: ChatCompletionRequestUserMessageContent::Text(
+                                            choice.message.content.unwrap(),
                                         ),
                                         ..Default::default()
                                     }
@@ -313,10 +399,11 @@ impl<R, T: Tools<R>> Agent<T, R> {
                 };
 
                 for choice in response.choices {
-                    if let Some(content) = &choice.delta.content
-                        && let Some(f) = &self.listen_content
-                    {
-                        (f)(&content);
+                    if let Some(content) = &choice.delta.content {
+                        trace!("Agent: {content:?}");
+                        if let Some(f) = &self.agent.as_mut().listen_content {
+                            (f)(&content);
+                        }
                     }
 
                     if let Some(tool_call_chunks) = choice.delta.tool_calls {
@@ -339,14 +426,14 @@ impl<R, T: Tools<R>> Agent<T, R> {
 
                             if let Some(function_chunk) = chunk.function {
                                 if let Some(name) = function_chunk.name {
-                                    if let Some(f) = &self.listen_tool_call {
+                                    if let Some(f) = &self.agent.as_mut().listen_tool_call {
                                         (f)(&name);
                                     }
 
                                     tool_call.function.name = name;
                                 }
                                 if let Some(arguments) = function_chunk.arguments {
-                                    if let Some(f) = &self.listen_tool_call {
+                                    if let Some(f) = &self.agent.as_mut().listen_tool_call {
                                         (f)(&arguments);
                                     }
 
@@ -363,7 +450,12 @@ impl<R, T: Tools<R>> Agent<T, R> {
                                 let tool_call_id = tool_call.id.clone();
                                 let result = {
                                     debug!("Executing tool: {name}");
-                                    let tool = self.tools.iter().find(|tool| tool.name() == name);
+                                    let tool = self
+                                        .agent
+                                        .as_mut()
+                                        .tools
+                                        .iter()
+                                        .find(|tool| tool.name() == name);
 
                                     match tool {
                                         Some(tool) => {
@@ -385,14 +477,14 @@ impl<R, T: Tools<R>> Agent<T, R> {
                                 }
                             }
                         }
-                        Some(FinishReason::Stop) => {
-                            let future = self.finish.invoke();
+                        Some(FinishReason::Stop | FinishReason::Length) => {
+                            let future = self.agent.as_mut().finish.invoke();
                             let pinned = Box::into_pin(future);
                             let result = pinned.await;
 
                             match result {
                                 ControlFlow::Continue(result) => {
-                                    messages.push(
+                                    self.messages.push(
                                         ChatCompletionRequestUserMessage::from(result).into(),
                                     );
                                 }
@@ -408,7 +500,7 @@ impl<R, T: Tools<R>> Agent<T, R> {
             if !execution_results.is_empty() {
                 let assistant_tool_calls: Vec<ChatCompletionMessageToolCalls> =
                     tool_calls.iter().map(|tc| tc.clone().into()).collect();
-                messages.push(
+                self.messages.push(
                     ChatCompletionRequestAssistantMessage {
                         content: None,
                         tool_calls: Some(assistant_tool_calls),
@@ -418,7 +510,7 @@ impl<R, T: Tools<R>> Agent<T, R> {
                 );
 
                 for (tool_call_id, response) in execution_results {
-                    messages.push(
+                    self.messages.push(
                         ChatCompletionRequestToolMessage {
                             content: response.to_string().into(),
                             tool_call_id,
@@ -431,14 +523,75 @@ impl<R, T: Tools<R>> Agent<T, R> {
     }
 }
 
+fn get_message_len(m: &ChatCompletionRequestMessage) -> usize {
+    match m {
+        ChatCompletionRequestMessage::System(m) => match &m.content {
+            ChatCompletionRequestSystemMessageContent::Text(t) => t.len(),
+            ChatCompletionRequestSystemMessageContent::Array(a) => a
+                .iter()
+                .map(|m| match m {
+                    ChatCompletionRequestSystemMessageContentPart::Text(t) => t.text.len(),
+                })
+                .sum::<usize>(),
+        },
+        ChatCompletionRequestMessage::User(m) => match &m.content {
+            ChatCompletionRequestUserMessageContent::Text(t) => t.len(),
+            ChatCompletionRequestUserMessageContent::Array(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    ChatCompletionRequestUserMessageContentPart::Text(t) => t.text.len(),
+                    _ => 0,
+                })
+                .sum(),
+        },
+        ChatCompletionRequestMessage::Assistant(m) => m
+            .content
+            .as_ref()
+            .map(|c| match c {
+                ChatCompletionRequestAssistantMessageContent::Text(t) => t.len(),
+                ChatCompletionRequestAssistantMessageContent::Array(a) => a
+                    .iter()
+                    .map(|m| match m {
+                        ChatCompletionRequestAssistantMessageContentPart::Text(t) => t.text.len(),
+                        ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => 0,
+                    })
+                    .sum::<usize>(),
+            })
+            .unwrap_or(0),
+        ChatCompletionRequestMessage::Tool(m) => match &m.content {
+            ChatCompletionRequestToolMessageContent::Text(t) => t.len(),
+            ChatCompletionRequestToolMessageContent::Array(a) => a
+                .iter()
+                .map(|m| match m {
+                    ChatCompletionRequestToolMessageContentPart::Text(t) => t.text.len(),
+                })
+                .sum::<usize>(),
+        },
+        ChatCompletionRequestMessage::Function(m) => {
+            m.content.as_ref().map(|c| c.len()).unwrap_or(0)
+        }
+        ChatCompletionRequestMessage::Developer(m) => match &m.content {
+            ChatCompletionRequestDeveloperMessageContent::Text(t) => t.len(),
+            ChatCompletionRequestDeveloperMessageContent::Array(a) => a
+                .iter()
+                .map(|m| match m {
+                    ChatCompletionRequestDeveloperMessageContentPart::Text(t) => t.text.len(),
+                })
+                .sum::<usize>(),
+        },
+    }
+}
+
 /// Invokes the LLM once, generating an output object directly.
 /// No tool calls are supported.
 pub async fn one_shot<C: Config, R: JsonSchema + DeserializeOwned>(
     client: &Client<C>,
+    model: &str,
     prompt: &str,
 ) -> R {
     let request = CreateChatCompletionRequestArgs::default()
         .messages(vec![ChatCompletionRequestUserMessage::from(prompt).into()])
+        .model(model)
         .response_format(ResponseFormat::JsonSchema {
             json_schema: ResponseFormatJsonSchema {
                 name: format!("Result"),

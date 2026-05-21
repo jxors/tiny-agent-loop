@@ -17,12 +17,15 @@ struct ResultArgs {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     let config = OpenAIConfig::new()
         .with_api_base("http://localhost:8080/v1")
         .with_api_key("not-needed");
     let client = Client::with_config(config);
 
     let result = Agent::new(
+        "any",
         (
             tool("add", "Add two integers together", |AddArgs { a, b }| async move {
                 ControlFlow::Continue(format!("Result: {}", a + b))
